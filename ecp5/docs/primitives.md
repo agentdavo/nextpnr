@@ -24,6 +24,8 @@ nextpnr-ecp5 currently supports the following primitives:
  - **L6MUX21** - 2 input multiplexer for LUT6 and above
  - **LUT4** - 4 input Look Up Table
  - **MULT18X18D** - DSP multiplier (cascade functionality not supported)
+ - **PRADD18A** - DSP pre-adder (experimental; currently only supported when directly feeding a `MULT18X18D` A bus via `POi->Ai`, packed into the multiplier)
+ - **PRADD9A** - DSP 9-bit pre-adder (experimental; same packing restrictions as `PRADD18A`, and intended for MULT9-mode once mode bits are available)
  - **ODDR71B** - 7:1 ODDR implementation
  - **ODDRX1F** - generic 2:1 output DDR
  - **ODDRX2DQA** - memory 4:1 output DDR primitive for DQ outputs

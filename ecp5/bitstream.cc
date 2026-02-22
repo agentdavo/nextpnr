@@ -527,6 +527,72 @@ struct ECP5Bitgen
         cc.tiles[tile].add_arc(sink, source);
     }
 
+    // Enable the internal PRADD18A output -> MULT18 A-input selection mux.
+    //
+    // Tiledata models this as routing mux bits, e.g.:
+    //   .mux JMULTA0
+    //   JPO0 F63B0
+    //
+    // The exact wire prefix and bit location varies by DSP tile type/column (e.g. W1_JPO0 -> W1_JMULTA0).
+    // We avoid hardcoding frame/bit by locating the pip in the chipdb and then using set_pip().
+    void enable_pradd18a_mux(CellInfo *ci, int bit = 0)
+    {
+        IdString a_pin = ctx->id("A" + std::to_string(bit));
+        WireId a_wire = ctx->getBelPinWire(ci->bel, a_pin);
+        if (a_wire == WireId()) {
+            log_error("PRADD18A mux enable: MULT18X18D '%s' has no bel pin wire for %s\n", ci->name.c_str(ctx),
+                      a_pin.c_str(ctx));
+        }
+
+        // Expand equivalence class through fixed pips to find the mux destination wire, then
+        // locate a configurable pip sourced from a JPO* wire.
+        pool<WireId> eq;
+        std::queue<WireId> q;
+        eq.insert(a_wire);
+        q.push(a_wire);
+
+        auto visit = [&](WireId w) {
+            if (w == WireId())
+                return;
+            if (eq.insert(w).second)
+                q.push(w);
+        };
+
+        while (!q.empty()) {
+            WireId w = q.front();
+            q.pop();
+            for (PipId pip : ctx->getPipsUphill(w)) {
+                if (ctx->get_pip_class(pip) == 0)
+                    continue;
+                visit(ctx->getPipSrcWire(pip));
+                visit(ctx->getPipDstWire(pip));
+            }
+            for (PipId pip : ctx->getPipsDownhill(w)) {
+                if (ctx->get_pip_class(pip) == 0)
+                    continue;
+                visit(ctx->getPipSrcWire(pip));
+                visit(ctx->getPipDstWire(pip));
+            }
+        }
+
+        const std::string want = "JPO" + std::to_string(bit);
+        for (WireId w : eq) {
+            for (PipId pip : ctx->getPipsUphill(w)) {
+                if (ctx->get_pip_class(pip) != 0)
+                    continue;
+                std::string src = get_trellis_wirename(pip.location, ctx->getPipSrcWire(pip));
+                if (src.find(want) == std::string::npos)
+                    continue;
+                // Found the configurable select pip; enabling any one bit enables the bus-wide selection.
+                set_pip(pip);
+                return;
+            }
+        }
+
+        log_error("PRADD18A mux enable: could not find a %s -> MULT18 A%d select pip for MULT18X18D '%s'\n",
+                  want.c_str(), bit, ci->name.c_str(ctx));
+    }
+
     unsigned permute_lut(CellInfo *cell, pool<IdString> &used_phys_pins, unsigned orig_init)
     {
         std::array<std::vector<unsigned>, 4> phys_to_log;
@@ -1128,6 +1194,11 @@ struct ECP5Bitgen
         tg.config.add_enum(dsp + ".CLK2_DIV", str_or_default(ci->params, id_CLK2_DIV, "ENABLED"));
         tg.config.add_enum(dsp + ".CLK3_DIV", str_or_default(ci->params, id_CLK3_DIV, "ENABLED"));
         tg.config.add_enum(dsp + ".GSR", str_or_default(ci->params, id_GSR, "ENABLED"));
+        tg.config.add_enum(dsp + ".CAS_MATCH_REG", str_or_default(ci->params, ctx->id("CAS_MATCH_REG"), "FALSE"));
+        tg.config.add_enum(dsp + ".MULT_BYPASS", str_or_default(ci->params, ctx->id("MULT_BYPASS"), "DISABLED"));
+        tg.config.add_enum(dsp + ".HIGHSPEED_CLK", str_or_default(ci->params, ctx->id("HIGHSPEED_CLK"), "NONE"));
+        // Present in vendor primitives and Trellis fuzzers, but the distributed DB may not include it yet.
+        tg.config.add_enum(dsp + ".MULT9_MODE", str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED"));
         tg.config.add_enum(dsp + ".SOURCEB_MODE", str_or_default(ci->params, id_SOURCEB_MODE, "B_SHIFT"));
         tg.config.add_enum(dsp + ".RESETMODE", str_or_default(ci->params, id_RESETMODE, "SYNC"));
 
@@ -1148,7 +1219,115 @@ struct ECP5Bitgen
             }
         }
 
+        // Check if PRADD18A was absorbed into this MULT
+        if (str_or_default(ci->params, ctx->id("HAS_PRADD"), "FALSE") == "TRUE") {
+            // PRADD18 index is 0 or 1 depending on which half of the DSP block
+            // MULT z=0,4 → PRADD18_0; MULT z=1,5 → PRADD18_1
+            int pradd_idx = (loc.z == 1 || loc.z == 5) ? 1 : 0;
+            std::string pradd = "PRADD18_" + std::to_string(pradd_idx);
+
+            // Get PRADD parameters (stored with PRADD_ prefix)
+            tg.config.add_enum(pradd + ".SOURCEA_MODE",
+                               str_or_default(ci->params, ctx->id("PRADD_SOURCEA_MODE"), "A_SHIFT"));
+            tg.config.add_enum(pradd + ".SOURCEB_MODE",
+                               str_or_default(ci->params, ctx->id("PRADD_SOURCEB_MODE"), "PARALLEL"));
+            tg.config.add_enum(pradd + ".FB_MUX",
+                               str_or_default(ci->params, ctx->id("PRADD_FB_MUX"), "DISABLED"));
+            tg.config.add_enum(pradd + ".SYMMETRY_MODE",
+                               str_or_default(ci->params, ctx->id("PRADD_SYMMETRY_MODE"), "DIRECT"));
+            tg.config.add_enum(pradd + ".REG_OPPRE_CLK",
+                               str_or_default(ci->params, ctx->id("PRADD_REG_OPPRE_CLK"), "NONE"));
+            tg.config.add_enum(pradd + ".REG_INPUTA_CLK",
+                               str_or_default(ci->params, ctx->id("PRADD_REG_INPUTA_CLK"), "NONE"));
+            tg.config.add_enum(pradd + ".REG_INPUTB_CLK",
+                               str_or_default(ci->params, ctx->id("PRADD_REG_INPUTB_CLK"), "NONE"));
+            tg.config.add_enum(pradd + ".RESETMODE",
+                               str_or_default(ci->params, ctx->id("PRADD_RESETMODE"), "SYNC"));
+            tg.config.add_enum(pradd + ".GSR",
+                               str_or_default(ci->params, ctx->id("PRADD_GSR"), "ENABLED"));
+        }
+
         tieoff_dsp_ports(ci);
+
+        // Optional MULT9 mode emission (placeholder): if a design was packed into MULT18 with MULT9 mode enabled,
+        // emit a MULT9_* config block too, matching the trellis fuzzer naming. This will only take effect once
+        // the DB has corresponding entries.
+        const bool mult9_enabled = str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED") != "DISABLED" ||
+                                   bool_or_default(ci->attrs, ctx->id("MULT9X9D_USED"), false);
+        if (mult9_enabled) {
+            const std::string m9 = "MULT9_" + std::to_string(loc.z);
+            tg.config.add_enum(m9 + ".MODE", "MULT9X9D");
+
+            auto m9enum = [&](const std::string &name, const std::string &defval) {
+                tg.config.add_enum(m9 + "." + name, str_or_default(ci->params, ctx->id(name), defval));
+            };
+
+            for (auto reg : {"INPUTA", "INPUTB", "INPUTC", "PIPELINE", "OUTPUT"}) {
+                m9enum(std::string("REG_") + reg + "_CLK", "NONE");
+                m9enum(std::string("REG_") + reg + "_CE", "CE0");
+                m9enum(std::string("REG_") + reg + "_RST", "RST0");
+            }
+            for (auto clk : {"CLK0", "CLK1", "CLK2", "CLK3"})
+                m9enum(std::string(clk) + "_DIV", "ENABLED");
+            m9enum("CAS_MATCH_REG", "FALSE");
+            m9enum("MULT_BYPASS", "DISABLED");
+            m9enum("GSR", "ENABLED");
+            m9enum("RESETMODE", "SYNC");
+            m9enum("SOURCEB_MODE", "B_SHIFT");
+            m9enum("HIGHSPEED_CLK", "NONE");
+        }
+
+        // If PRADD was packed into this MULT, emit the PRADD config block too.
+        // This is required to later enable true PRADD behavior once the Trellis DB
+        // contains PRADD*.MODE and friends (today the distributed db is missing them).
+        auto emit_pradd_cfg = [&](bool is_pradd9) {
+            const std::string pr = is_pradd9 ? "PRADD9_" : "PRADD18_";
+            const std::string prpfx = is_pradd9 ? "PRADD9_" : "PRADD18_";
+            const std::string mode = is_pradd9 ? "PRADD9A" : "PRADD18A";
+            const std::string inst = pr + std::to_string(loc.z);
+
+            tg.config.add_enum(inst + ".MODE", mode);
+
+            auto penum = [&](const std::string &name, const std::string &defval) {
+                tg.config.add_enum(inst + "." + name, str_or_default(ci->params, ctx->id(prpfx + name), defval));
+            };
+
+            // Register controls
+            for (auto reg : {"INPUTA", "INPUTB", "INPUTC"}) {
+                penum(std::string("REG_") + reg + "_CLK", "NONE");
+                penum(std::string("REG_") + reg + "_CE", "CE0");
+                penum(std::string("REG_") + reg + "_RST", "RST0");
+            }
+            penum("REG_OPPRE_CLK", "NONE");
+            penum("REG_OPPRE_CE", "CE0");
+            penum("REG_OPPRE_RST", "RST0");
+
+            // Misc controls
+            penum("GSR", "ENABLED");
+            penum("CAS_MATCH_REG", "FALSE");
+            penum("RESETMODE", "SYNC");
+            penum("SOURCEA_MODE", "A_SHIFT");
+            penum("SOURCEB_MODE", "SHIFT");
+            penum("FB_MUX", "SHIFT");
+            penum("SYMMETRY_MODE", "DIRECT");
+            penum("HIGHSPEED_CLK", "NONE");
+
+            // Clock dividers (present on most DSP primitives)
+            for (auto clk : {"CLK0", "CLK1", "CLK2", "CLK3"})
+                penum(std::string(clk) + "_DIV", "ENABLED");
+        };
+
+        // If the packer merged a PRADD* into this MULT18X18D, enable the internal
+        // preadder output selection mux so the multiplier A input is sourced from JPO*.
+        if (bool_or_default(ci->attrs, ctx->id("PRADD18A_USED"), false) ||
+            bool_or_default(ci->attrs, ctx->id("PRADD9A_USED"), false)) {
+            enable_pradd18a_mux(ci, /*bit=*/0);
+        }
+        if (bool_or_default(ci->attrs, ctx->id("PRADD18A_USED"), false))
+            emit_pradd_cfg(/*is_pradd9=*/false);
+        if (bool_or_default(ci->attrs, ctx->id("PRADD9A_USED"), false))
+            emit_pradd_cfg(/*is_pradd9=*/true);
+
         cc.tilegroups.push_back(tg);
     }
 
@@ -1196,6 +1375,8 @@ struct ECP5Bitgen
         tg.config.add_enum(dsp + ".FORCE_ZERO_BARREL_SHIFT",
                            str_or_default(ci->params, id_FORCE_ZERO_BARREL_SHIFT, "DISABLED"));
         tg.config.add_enum(dsp + ".LEGACY", str_or_default(ci->params, id_LEGACY, "DISABLED"));
+        // Present in vendor primitives and Trellis fuzzers, but the distributed DB may not include it yet.
+        tg.config.add_enum(dsp + ".MULT9_MODE", str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED"));
 
         tg.config.add_enum(dsp + ".MODE", "ALU54B");
 
@@ -1217,6 +1398,217 @@ struct ECP5Bitgen
                 tg.config.add_enum("MULT18_0.CIBOUT_BYP", "ON");
             }
         }
+
+        // Optional ALU24 mode emission (placeholder): if an upstream flow encodes ALU24 usage into an ALU54 cell,
+        // emit an ALU24_* config block too, matching the trellis fuzzer naming. This will only take effect once
+        // the DB has corresponding entries.
+        //
+        // Triggers:
+        // - `ALU24_MODE` param set to something other than "NONE" (recommended)
+        // - or `ALU24B_USED` attr set (packer hook)
+        const std::string alu24_mode = str_or_default(ci->params, ctx->id("ALU24_MODE"), "NONE");
+        if (alu24_mode != "NONE" || bool_or_default(ci->attrs, ctx->id("ALU24B_USED"), false)) {
+            const std::string a24 = "ALU24_" + std::to_string(loc.z);
+            const std::string mode = (alu24_mode != "NONE") ? alu24_mode : std::string("ALU24B");
+            tg.config.add_enum(a24 + ".MODE", mode);
+
+            auto a24enum = [&](const std::string &name, const std::string &defval) {
+                tg.config.add_enum(a24 + "." + name, str_or_default(ci->params, ctx->id(name), defval));
+            };
+
+            for (auto reg : {"OUTPUT", "OPCODE_0", "OPCODE_1", "INPUTCFB"}) {
+                a24enum(std::string("REG_") + reg + "_CLK", "NONE");
+                a24enum(std::string("REG_") + reg + "_CE", "CE0");
+                a24enum(std::string("REG_") + reg + "_RST", "RST0");
+            }
+            for (auto clk : {"CLK0", "CLK1", "CLK2", "CLK3"})
+                a24enum(std::string(clk) + "_DIV", "ENABLED");
+            a24enum("GSR", "ENABLED");
+            a24enum("RESETMODE", "SYNC");
+        }
+
+        tieoff_dsp_ports(ci);
+        cc.tilegroups.push_back(tg);
+    }
+
+    void write_alu24b(CellInfo *ci)
+    {
+        // ALU24B uses the ALU54 hardware with MODE=ALU54B
+        // Placed at ALU24_RxxCxx sites which map to ALU54_7 internally
+        TileGroup tg;
+        Loc loc = ctx->getBelLocation(ci->bel);
+        tg.tiles = get_dsp_tiles(ci->bel);
+
+        // ALU24B always uses ALU54_7 position in the DSP block
+        std::string dsp = "ALU54_7";
+
+        // Set mode to ALU54B (shared with ALU24B)
+        tg.config.add_enum(dsp + ".MODE", "ALU54B");
+
+        // Output register control (ALU24B has R[23:0] output)
+        tg.config.add_enum(dsp + ".REG_OUTPUT0_CLK", str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_OUTPUT0_CE", str_or_default(ci->params, id_REG_OUTPUT_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_OUTPUT0_RST", str_or_default(ci->params, id_REG_OUTPUT_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_OUTPUT1_CLK", "NONE");
+        tg.config.add_enum(dsp + ".REG_OUTPUT1_RST", "RST0");
+
+        // Opcode register controls
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_0_CLK", str_or_default(ci->params, id_REG_OPCODEOP0_0_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_0_CE", str_or_default(ci->params, id_REG_OPCODEOP0_0_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_0_RST", str_or_default(ci->params, id_REG_OPCODEOP0_0_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_OPCODEOP1_0_CLK", str_or_default(ci->params, id_REG_OPCODEOP1_0_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_1_CLK", "NONE");
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_1_CE", "CE0");
+        tg.config.add_enum(dsp + ".REG_OPCODEOP0_1_RST", "RST0");
+        tg.config.add_enum(dsp + ".REG_OPCODEOP1_1_CLK", "NONE");
+
+        // Input C feedback register (CFB input)
+        tg.config.add_enum(dsp + ".REG_INPUTC0_CLK", str_or_default(ci->params, id_REG_INPUTCFB_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_INPUTC1_CLK", "NONE");
+
+        // Opcode input registers (for cascaded ALUs)
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_0_CLK", "NONE");
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_0_CE", "CE0");
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_0_RST", "RST0");
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_1_CLK", "NONE");
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_1_CE", "CE0");
+        tg.config.add_enum(dsp + ".REG_OPCODEIN_1_RST", "RST0");
+
+        // Flag register (not used in ALU24B typically)
+        tg.config.add_enum(dsp + ".REG_FLAG_CLK", "NONE");
+
+        // Clock divisors
+        tg.config.add_enum(dsp + ".CLK0_DIV", str_or_default(ci->params, id_CLK0_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK1_DIV", str_or_default(ci->params, id_CLK1_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK2_DIV", str_or_default(ci->params, id_CLK2_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK3_DIV", str_or_default(ci->params, id_CLK3_DIV, "ENABLED"));
+
+        // GSR and reset mode
+        tg.config.add_enum(dsp + ".GSR", str_or_default(ci->params, id_GSR, "ENABLED"));
+        tg.config.add_enum(dsp + ".RESETMODE", str_or_default(ci->params, id_RESETMODE, "SYNC"));
+
+        // ALU54B-specific settings (not used but need defaults)
+        tg.config.add_enum(dsp + ".MCPAT_SOURCE", "STATIC");
+        tg.config.add_enum(dsp + ".MASKPAT_SOURCE", "STATIC");
+        tg.config.add_enum(dsp + ".FORCE_ZERO_BARREL_SHIFT", "DISABLED");
+        tg.config.add_enum(dsp + ".LEGACY", "DISABLED");
+
+        // Enable DSP output routing
+        tg.config.add_enum("DSP_RIGHT.CIBOUT", "ON");
+
+        // CIBOUT_BYP for unregistered output
+        if (str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE") == "NONE") {
+            tg.config.add_enum("MULT18_4.CIBOUT_BYP", "ON");
+        }
+
+        tieoff_dsp_ports(ci);
+        cc.tilegroups.push_back(tg);
+    }
+
+    void write_pradd18(CellInfo *ci)
+    {
+        TileGroup tg;
+        Loc loc = ctx->getBelLocation(ci->bel);
+        tg.tiles = get_dsp_tiles(ci->bel);
+        // PRADD18 index is 0 or 1 depending on which half of the DSP block
+        // z=0,4 → PRADD18_0; z=1,5 → PRADD18_1
+        int pradd_idx = (loc.z == 1 || loc.z == 5) ? 1 : 0;
+        std::string dsp = "PRADD18_" + std::to_string(pradd_idx);
+
+        // PRADD18A-specific parameters
+        tg.config.add_enum(dsp + ".SOURCEA_MODE", str_or_default(ci->params, id_SOURCEA_MODE, "A_SHIFT"));
+        tg.config.add_enum(dsp + ".SOURCEB_MODE", str_or_default(ci->params, id_SOURCEB_MODE, "PARALLEL"));
+        tg.config.add_enum(dsp + ".FB_MUX", str_or_default(ci->params, id_FB_MUX, "DISABLED"));
+        tg.config.add_enum(dsp + ".SYMMETRY_MODE", str_or_default(ci->params, id_SYMMETRY_MODE, "DIRECT"));
+
+        // Register stage parameters
+        tg.config.add_enum(dsp + ".REG_INPUTA_CLK", str_or_default(ci->params, id_REG_INPUTA_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_INPUTA_CE", str_or_default(ci->params, id_REG_INPUTA_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_INPUTA_RST", str_or_default(ci->params, id_REG_INPUTA_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_CLK", str_or_default(ci->params, id_REG_INPUTB_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_CE", str_or_default(ci->params, id_REG_INPUTB_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_RST", str_or_default(ci->params, id_REG_INPUTB_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_INPUTC_CLK", str_or_default(ci->params, id_REG_INPUTC_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_OPPRE_CLK", str_or_default(ci->params, id_REG_OPPRE_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_OPPRE_CE", str_or_default(ci->params, id_REG_OPPRE_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_OPPRE_RST", str_or_default(ci->params, id_REG_OPPRE_RST, "RST0"));
+
+        // Common DSP parameters
+        tg.config.add_enum(dsp + ".CLK0_DIV", str_or_default(ci->params, id_CLK0_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK1_DIV", str_or_default(ci->params, id_CLK1_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK2_DIV", str_or_default(ci->params, id_CLK2_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK3_DIV", str_or_default(ci->params, id_CLK3_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".GSR", str_or_default(ci->params, id_GSR, "ENABLED"));
+        tg.config.add_enum(dsp + ".RESETMODE", str_or_default(ci->params, id_RESETMODE, "SYNC"));
+        tg.config.add_enum(dsp + ".CAS_MATCH_REG", str_or_default(ci->params, id_CAS_MATCH_REG, "FALSE"));
+
+        tg.config.add_enum(dsp + ".MODE", "PRADD18A");
+
+        if (loc.z < 4)
+            tg.config.add_enum("DSP_LEFT.CIBOUT", "ON");
+        else
+            tg.config.add_enum("DSP_RIGHT.CIBOUT", "ON");
+
+        // Clock/CE/RST muxes
+        for (auto port : {"CLK", "CE", "RST"}) {
+            for (int i = 0; i < 4; i++) {
+                std::string sig = port + std::to_string(i);
+                tg.config.add_enum(dsp + "." + sig + "MUX", sig);
+            }
+        }
+
+        tieoff_dsp_ports(ci);
+        cc.tilegroups.push_back(tg);
+    }
+
+    void write_mult9(CellInfo *ci)
+    {
+        // MULT9X9D uses the same hardware as MULT18X18D
+        // The bit encoding is identical - Diamond synthesizes MULT9 to MULT18 internally
+        TileGroup tg;
+        Loc loc = ctx->getBelLocation(ci->bel);
+        tg.tiles = get_dsp_tiles(ci->bel);
+        std::string dsp = "MULT18_" + std::to_string(loc.z);
+
+        tg.config.add_enum(dsp + ".REG_INPUTA_CLK", str_or_default(ci->params, id_REG_INPUTA_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_INPUTA_CE", str_or_default(ci->params, id_REG_INPUTA_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_INPUTA_RST", str_or_default(ci->params, id_REG_INPUTA_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_CLK", str_or_default(ci->params, id_REG_INPUTB_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_CE", str_or_default(ci->params, id_REG_INPUTB_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_INPUTB_RST", str_or_default(ci->params, id_REG_INPUTB_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_INPUTC_CLK", str_or_default(ci->params, id_REG_INPUTC_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_PIPELINE_CLK", str_or_default(ci->params, id_REG_PIPELINE_CLK, "NONE"));
+        tg.config.add_enum(dsp + ".REG_PIPELINE_CE", str_or_default(ci->params, id_REG_PIPELINE_CE, "CE0"));
+        tg.config.add_enum(dsp + ".REG_PIPELINE_RST", str_or_default(ci->params, id_REG_PIPELINE_RST, "RST0"));
+        tg.config.add_enum(dsp + ".REG_OUTPUT_CLK", str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE"));
+        if (dsp == "MULT18_0" || dsp == "MULT18_4")
+            tg.config.add_enum(dsp + ".REG_OUTPUT_RST", str_or_default(ci->params, id_REG_OUTPUT_RST, "RST0"));
+
+        tg.config.add_enum(dsp + ".CLK0_DIV", str_or_default(ci->params, id_CLK0_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK1_DIV", str_or_default(ci->params, id_CLK1_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK2_DIV", str_or_default(ci->params, id_CLK2_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".CLK3_DIV", str_or_default(ci->params, id_CLK3_DIV, "ENABLED"));
+        tg.config.add_enum(dsp + ".GSR", str_or_default(ci->params, id_GSR, "ENABLED"));
+        tg.config.add_enum(dsp + ".SOURCEB_MODE", str_or_default(ci->params, id_SOURCEB_MODE, "B_SHIFT"));
+        tg.config.add_enum(dsp + ".RESETMODE", str_or_default(ci->params, id_RESETMODE, "SYNC"));
+
+        // MULT9X9D uses MULT18X18D mode in hardware
+        tg.config.add_enum(dsp + ".MODE", "MULT18X18D");
+        if (str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE") == "NONE" && ci->cluster == ClusterId())
+            tg.config.add_enum(dsp + ".CIBOUT_BYP", "ON");
+
+        if (loc.z < 4)
+            tg.config.add_enum("DSP_LEFT.CIBOUT", "ON");
+        else
+            tg.config.add_enum("DSP_RIGHT.CIBOUT", "ON");
+
+        for (auto port : {"CLK", "CE", "RST"}) {
+            for (int i = 0; i < 4; i++) {
+                std::string sig = port + std::to_string(i);
+                tg.config.add_enum(dsp + "." + sig + "MUX", sig);
+            }
+        }
+
         tieoff_dsp_ports(ci);
         cc.tilegroups.push_back(tg);
     }
@@ -1473,10 +1865,29 @@ struct ECP5Bitgen
                 cc.tiles[tile].add_enum(dcs + ".DCSMODE", str_or_default(ci->attrs, id_DCSMODE, "POS"));
             } else if (ci->type == id_DP16KD) {
                 write_bram(ci);
-            } else if (ci->type == id_MULT18X18D) {
+            } else if (ci->type == id_MULT18X18D || ci->type == id_MULT18X18C) {
+                // MULT18X18C is simplified variant without C input and CLK_DIV
                 write_mult18(ci);
-            } else if (ci->type == id_ALU54B) {
-                write_alu54(ci);
+            } else if (ci->type == id_MULT9X9D || ci->type == id_MULT9X9C) {
+                // MULT9X9C is simplified variant without C input and CLK_DIV
+                write_mult9(ci);
+            } else if (ci->type == id_PRADD18A) {
+                write_pradd18(ci);
+            } else if (ci->type == id_PRADD9A) {
+                // PRADD9A uses same hardware as PRADD18A, just with 9-bit ports
+                write_pradd18(ci);
+            } else if (ci->type == id_ALU54B || ci->type == id_ALU54A) {
+                // Check if this was originally ALU24B/A (converted to ALU54B for placement)
+                auto orig_type = ci->attrs.find(ctx->id("ORIGINAL_TYPE"));
+                if (orig_type != ci->attrs.end() && orig_type->second.as_string() == "ALU24B") {
+                    write_alu24b(ci);
+                } else {
+                    // ALU54A is simplified variant without CFB, CO, CLK_DIV
+                    write_alu54(ci);
+                }
+            } else if (ci->type == id_ALU24B || ci->type == id_ALU24A) {
+                // ALU24A is simplified variant without CFB, CO, CLK_DIV
+                write_alu24b(ci);
             } else if (ci->type == id_EHXPLLL) {
                 write_pll(ci);
             } else if (ci->type.in(id_IOLOGIC, id_SIOLOGIC)) {

@@ -889,7 +889,7 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
         return false;
     } else if (cell->type == id_DP16KD) {
         return false;
-    } else if (cell->type == id_MULT18X18D) {
+    } else if (cell->type.in(id_MULT18X18D, id_MULT9X9D, id_MULT9X9C, id_MULT18X18C)) {
         if (cell->multInfo.is_clocked)
             return false;
         std::string fn = fromPort.str(this), tn = toPort.str(this);
@@ -898,6 +898,8 @@ bool Arch::getCellDelay(const CellInfo *cell, IdString fromPort, IdString toPort
                 return get_delay_from_tmg_db(cell->multInfo.timing_id, id(std::string("") + fn.front()), id_P, delay);
         }
         return false;
+    } else if (cell->type.in(id_ALU24B, id_ALU24A)) {
+        return false; // ALU timing not modeled
     } else if (cell->type.in(id_IOLOGIC, id_SIOLOGIC)) {
         return false;
     } else {
@@ -977,7 +979,7 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
             return (cell->ports.at(port).type == PORT_OUT) ? TMG_REGISTER_OUTPUT : TMG_REGISTER_INPUT;
         }
         NPNR_ASSERT_FALSE_STR("no timing type for RAM port '" + port.str(this) + "'");
-    } else if (cell->type == id_MULT18X18D) {
+    } else if (cell->type.in(id_MULT18X18D, id_MULT9X9D, id_MULT9X9C, id_MULT18X18C)) {
         if (port.in(id_CLK0, id_CLK1, id_CLK2, id_CLK3))
             return TMG_CLOCK_INPUT;
         if (port.in(id_CE0, id_CE1, id_CE2, id_CE3, id_RST0, id_RST1, id_RST2, id_RST3, id_SIGNEDA, id_SIGNEDB)) {
@@ -1008,7 +1010,7 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
             }
         }
         return TMG_IGNORE;
-    } else if (cell->type == id_ALU54B) {
+    } else if (cell->type.in(id_ALU54B, id_ALU24B, id_ALU24A, id_ALU54A)) {
         return TMG_IGNORE; // FIXME
     } else if (cell->type == id_EHXPLLL) {
         return TMG_IGNORE;
@@ -1183,7 +1185,7 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
         } else {
             NPNR_ASSERT_FALSE("unknown DQSBUFM register port");
         }
-    } else if (cell->type == id_MULT18X18D) {
+    } else if (cell->type.in(id_MULT18X18D, id_MULT9X9D, id_MULT9X9C, id_MULT18X18C)) {
         std::string port_name = port.str(this);
         // To keep the timing DB small, like signals (e.g. P[35:0] have been
         // grouped. To look up the timing, we therefore need to map this port
@@ -1206,7 +1208,7 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
             // Both SIGNEDA and SIGNEDB exist in the DB, so can directly use these here
             port_group = port;
         } else {
-            NPNR_ASSERT_FALSE("Unknown MULT18X18D register port");
+            NPNR_ASSERT_FALSE("Unknown MULT register port");
         }
 
         // If this port is clocked at all, it must be clocked from CLK0

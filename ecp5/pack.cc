@@ -1066,6 +1066,17 @@ class Ecp5Packer
         }
     }
 
+    void autocreate_empty_output_port(CellInfo *cell, IdString port)
+    {
+        if (!cell->ports.count(port)) {
+            cell->ports[port].name = port;
+            cell->ports[port].net = nullptr;
+            cell->ports[port].type = PORT_OUT;
+        } else {
+            cell->ports[port].type = PORT_OUT;
+        }
+    }
+
     // Pack EBR
     void pack_ebr()
     {
@@ -1170,10 +1181,196 @@ class Ecp5Packer
     // Pack DSPs
     void pack_dsps()
     {
+        // Minimal PRADD18A bring-up:
+        //
+        // Treat PRADD18A as functionality integrated into the MULT18X18D BEL by
+        // merging its ports onto the corresponding MULT18X18D cell. This lets
+        // nextpnr route the internal JPO* -> JMULTA* selection pips (which are
+        // expressed as routing mux bits in tiledata) using normal net routing.
+        //
+        // Note: This is intentionally conservative and currently supports only
+        // the common pattern where PRADD18A.PO[i] drives MULT18X18D.A[i].
+        std::vector<CellInfo *> pradds;
         for (auto &cell : ctx->cells) {
             CellInfo *ci = cell.second.get();
-            if (ci->type == id_MULT18X18D) {
+            if (ci->type.in(id_PRADD18A, id_PRADD9A))
+                pradds.push_back(ci);
+        }
+        if (!pradds.empty()) {
+            for (CellInfo *pradd : pradds) {
+                const bool is_pradd9 = (pradd->type == id_PRADD9A);
+                const int pr_width = is_pradd9 ? 9 : 18;
+                const IdString pr_used_attr = ctx->id(is_pradd9 ? "PRADD9A_USED" : "PRADD18A_USED");
+
+                CellInfo *mult = nullptr;
+
+                // Discover the associated MULT18X18D by looking for PO[i] nets
+                // that drive A[i] on a MULT18X18D.
+                for (int i = 0; i < pr_width; i++) {
+                    IdString po_port = ctx->id("PO" + std::to_string(i));
+                    NetInfo *po_net = pradd->getPort(po_port);
+                    if (po_net == nullptr)
+                        continue;
+                    IdString expected_mult_port = ctx->id("A" + std::to_string(i));
+                    for (auto user : po_net->users) {
+                        if (user.cell == nullptr)
+                            continue;
+                        if (user.cell->type != id_MULT18X18D) {
+                            // v1 limitation: PRADD output must be used only to feed the
+                            // associated multiplier A bus, not routed elsewhere.
+                            log_error("%s '%s' output %s is used by non-MULT18X18D cell '%s'\n",
+                                      pradd->type.c_str(ctx), pradd->name.c_str(ctx), po_port.c_str(ctx),
+                                      user.cell->name.c_str(ctx));
+                        }
+                        if (user.port != expected_mult_port) {
+                            log_error("%s '%s' PO%d drives MULT18X18D '%s' port %s; only POi->Ai is supported\n",
+                                      pradd->type.c_str(ctx), pradd->name.c_str(ctx), i, user.cell->name.c_str(ctx),
+                                      user.port.c_str(ctx));
+                        }
+                        if (mult != nullptr && mult != user.cell) {
+                            log_error("%s '%s' appears to drive multiple MULT18X18D cells; not supported\n",
+                                      pradd->type.c_str(ctx), pradd->name.c_str(ctx));
+                        }
+                        mult = user.cell;
+                    }
+                }
+
+                if (mult == nullptr) {
+                    log_error("%s '%s' is not connected to a MULT18X18D via POi->Ai; cannot pack\n",
+                              pradd->type.c_str(ctx), pradd->name.c_str(ctx));
+                }
+
+                // Reject shift-chain outputs for now (v1 bring-up).
+                for (auto sro : {"SROA", "SROB"}) {
+                    for (int i = 0; i < pr_width; i++) {
+                        IdString p = ctx->id(std::string(sro) + std::to_string(i));
+                        NetInfo *n = pradd->getPort(p);
+                        if (n != nullptr && !n->users.empty()) {
+                            log_error("%s '%s' output %s is used; shift-chain is not supported in v1 packing\n",
+                                      pradd->type.c_str(ctx), pradd->name.c_str(ctx), p.c_str(ctx));
+                        }
+                    }
+                }
+
+                // Helper: unify shared-named ports (e.g. CLK/CE/RST/C/SRIA/SRIB/SOURCEA) onto MULT.
+                auto unify_in = [&](IdString port) {
+                    NetInfo *pnet = pradd->getPort(port);
+                    if (pnet == nullptr)
+                        return;
+                    NetInfo *mnet = mult->getPort(port);
+                    if (mnet != nullptr && mnet != pnet) {
+                        // Treat constants as equivalent even when represented as distinct nets pre-pack_constants.
+                        // (json-imported constant connections frequently end up as unique constant nets.)
+                        if (mnet->constant_value != IdString() && pnet->constant_value != IdString() &&
+                            mnet->constant_value == pnet->constant_value) {
+                            return;
+                        }
+                        log_error("%s '%s' and MULT18X18D '%s' disagree on net for port %s\n",
+                                  pradd->type.c_str(ctx), pradd->name.c_str(ctx), mult->name.c_str(ctx),
+                                  port.c_str(ctx));
+                    }
+                    if (mnet == nullptr) {
+                        autocreate_empty_port(mult, port);
+                        mult->connectPort(port, pnet);
+                    }
+                };
+
+                for (auto sig : {"CLK", "CE", "RST"})
+                    for (int i = 0; i < 4; i++)
+                        unify_in(ctx->id(std::string(sig) + std::to_string(i)));
+                unify_in(id_SOURCEA);
+                for (int i = 0; i < pr_width; i++)
+                    unify_in(ctx->id("C" + std::to_string(i)));
+                for (auto sr : {"SRIA", "SRIB"})
+                    for (int i = 0; i < pr_width; i++)
+                        unify_in(ctx->id(std::string(sr) + std::to_string(i)));
+
+                // PRADD9 caveat: the JPO* -> JMULTA* select is bus-wide in tiledata. In PRADD9 mode,
+                // bits [9..17] of JPO are not exposed as PRADD9 outputs, so feeding PRADD9 into a full 18-bit
+                // multiplier would silently override the upper A-bits. Until MULT9 mode is supported end-to-end,
+                // be conservative and require upper A-bits to be unconnected or constant.
+                if (is_pradd9) {
+                    for (int i = 9; i < 18; i++) {
+                        IdString a = ctx->id("A" + std::to_string(i));
+                        NetInfo *n = mult->getPort(a);
+                        if (n == nullptr)
+                            continue;
+                        if (n->constant_value != IdString())
+                            continue;
+                        if (n->driver.cell != nullptr && n->driver.cell->type.in(id_GND, id_VCC))
+                            continue;
+                        log_error("PRADD9A '%s' feeds MULT18X18D '%s', but %s is connected to non-constant net '%s'; "
+                                  "this is unsafe unless MULT9 mode is enabled\n",
+                                  pradd->name.c_str(ctx), mult->name.c_str(ctx), a.c_str(ctx), n->name.c_str(ctx));
+                    }
+                }
+
+                // Mark that this MULT18X18D uses the integrated PRADD.
+                // Bitstream generation will enable the appropriate internal JPO*->JMULTA* select pip(s).
+                mult->attrs[pr_used_attr] = 1;
+
+                // Preserve PRADD configuration parameters on the MULT cell so bitstream/textcfg emission
+                // can configure PRADD mode/registers once the Trellis DB contains those settings.
+                //
+                // We do not copy these into the MULT's own params (names collide); instead we namespace
+                // them with PRADD9_/PRADD18_ prefixes.
+                const std::string prpfx = is_pradd9 ? "PRADD9_" : "PRADD18_";
+                for (auto &pp : pradd->params) {
+                    mult->params[ctx->id(prpfx + pp.first.str(ctx))] = pp.second;
+                }
+
+                // The PO* -> A* connection is internal to the DSP block; do not model it as a routed net.
+                // Keeping it as a normal net creates a self-driven feedback net on a single cell, which can
+                // confuse routing and isn't how the hardware is meant to be treated.
+                for (int i = 0; i < pr_width; i++) {
+                    IdString po_port = ctx->id("PO" + std::to_string(i));
+                    NetInfo *po_net = pradd->getPort(po_port);
+                    if (po_net == nullptr)
+                        continue;
+                    pradd->disconnectPort(po_port);
+                    mult->disconnectPort(ctx->id("A" + std::to_string(i)));
+                }
+
+                // Merge PRADD inputs: PA*, PB*, and OPPRE.
+                for (auto bus : {"PA", "PB"}) {
+                    for (int i = 0; i < pr_width; i++) {
+                        IdString p = ctx->id(std::string(bus) + std::to_string(i));
+                        NetInfo *n = pradd->getPort(p);
+                        if (n == nullptr)
+                            continue;
+                        autocreate_empty_port(mult, p);
+                        mult->connectPort(p, n);
+                    }
+                }
+                {
+                    NetInfo *n = pradd->getPort(id_OPPRE);
+                    if (n != nullptr) {
+                        autocreate_empty_port(mult, id_OPPRE);
+                        mult->connectPort(id_OPPRE, n);
+                    }
+                }
+
+                // Disconnect remaining PRADD ports to keep net user lists consistent before deletion.
+                std::vector<IdString> pr_ports;
+                pr_ports.reserve(pradd->ports.size());
+                for (auto &p : pradd->ports)
+                    pr_ports.push_back(p.first);
+                for (IdString p : pr_ports)
+                    pradd->disconnectPort(p);
+
+                packed_cells.insert(pradd->name);
+            }
+            flush_cells();
+        }
+
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (ci->type == id_MULT18X18D || ci->type == id_MULT18X18C) {
                 // Add ports, even if disconnected, to ensure correct tie-offs
+                // MULT18X18C is simplified version without C input and CLK_DIV - maps to same hardware
+                // Convert MULT18X18C to MULT18X18D for placement (hardware is the same)
+                if (ci->type == id_MULT18X18C)
+                    ci->type = id_MULT18X18D;
                 for (auto sig : {"CLK", "CE", "RST"})
                     for (int i = 0; i < 4; i++)
                         autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
@@ -1186,7 +1383,264 @@ class Ecp5Packer
                 for (auto port : {"SRIA", "SRIB"})
                     for (int i = 0; i < 18; i++)
                         autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
-            } else if (ci->type == id_ALU54B) {
+            } else if (ci->type == id_MULT9X9D || ci->type == id_MULT9X9C) {
+                // MULT9X9D/C uses the same hardware as MULT18X18D but with 9-bit ports
+                // MULT9X9C is simplified version without C input and CLK_DIV - maps to same hardware
+                // Convert to MULT18X18D for placement (hardware is the same)
+                ci->type = id_MULT18X18D;
+                for (auto sig : {"CLK", "CE", "RST"})
+                    for (int i = 0; i < 4; i++)
+                        autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
+                for (auto sig : {"SIGNED", "SOURCE"})
+                    for (auto c : {"A", "B"})
+                        autocreate_empty_port(ci, ctx->id(sig + std::string(c)));
+                // MULT9X9D has 9-bit ports, but hardware has 18-bit - create all 18
+                for (auto port : {"A", "B", "C"})
+                    for (int i = 0; i < 18; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+                for (auto port : {"SRIA", "SRIB"})
+                    for (int i = 0; i < 18; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+            } else if (ci->type == id_PRADD18A) {
+                // PRADD18A is a pre-adder that must be paired with MULT18X18D
+                for (auto sig : {"CLK", "CE", "RST"})
+                    for (int i = 0; i < 4; i++)
+                        autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
+                // PRADD18A uses PA, PB for preadder inputs (not A, B)
+                for (auto port : {"PA", "PB"})
+                    for (int i = 0; i < 18; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+                for (auto port : {"SRIA", "SRIB", "SROA", "SROB"})
+                    for (int i = 0; i < 18; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+                // Pre-adder output ports (PO connects to MULT A input)
+                for (int i = 0; i < 18; i++)
+                    autocreate_empty_port(ci, ctx->id("PO" + std::to_string(i)));
+                // OPPRE - single-bit output path register bypass control
+                autocreate_empty_port(ci, ctx->id("OPPRE"));
+                autocreate_empty_port(ci, id_SIGNEDA);
+                autocreate_empty_port(ci, id_SIGNEDB);
+                autocreate_empty_port(ci, id_SOURCEA);
+                autocreate_empty_port(ci, id_SOURCEB);
+
+                // Find the MULT18X18D/C that this PRADD18A feeds
+                // PRADD18A.PO[17:0] -> MULT18X18D/C.A[17:0]
+                CellInfo *mult = nullptr;
+                NetInfo *net = ci->ports.count(id_PO0) ? ci->ports.at(id_PO0).net : nullptr;
+                if (net != nullptr) {
+                    for (auto &user : net->users) {
+                        if ((user.cell->type == id_MULT18X18D || user.cell->type == id_MULT18X18C) && user.port == id_A0) {
+                            mult = user.cell;
+                            break;
+                        }
+                    }
+                }
+
+                if (mult != nullptr) {
+                    // Absorb PRADD18A into the MULT18X18D cell
+                    // Copy PRADD18A parameters to MULT with PRADD_ prefix
+                    for (auto &param : ci->params) {
+                        mult->params[ctx->id("PRADD_" + param.first.str(ctx))] = param.second;
+                    }
+                    // Mark that this MULT has a PRADD attached
+                    mult->params[ctx->id("HAS_PRADD")] = Property("TRUE");
+
+                    // In the ECP5 DSP architecture, PRADD and MULT share the same physical block.
+                    // The PRADD PA/PB inputs are routed through the same pins as MULT A input.
+                    // The MULT A input in the netlist (connected to PRADD PO) becomes an internal
+                    // connection in hardware.
+                    //
+                    // For now, we transfer PA/PB inputs to MULT A input ports since that's
+                    // where they physically route in the hardware:
+                    // - PRADD.PA[17:0] -> maps to MULT.A[17:0] in hardware
+                    // - PRADD.PB[17:0] -> maps to MULT.B[17:0] in hardware (uses SOURCEB_MODE)
+                    //
+                    // First disconnect MULT A from the PRADD PO output net (internal in HW)
+                    for (int i = 0; i < 18; i++) {
+                        IdString mult_a_port = ctx->id("A" + std::to_string(i));
+                        if (mult->ports.count(mult_a_port) && mult->ports[mult_a_port].net) {
+                            mult->disconnectPort(mult_a_port);
+                        }
+                    }
+
+                    // Transfer PRADD PA inputs to MULT A ports
+                    for (int i = 0; i < 18; i++) {
+                        IdString pradd_pa = ctx->id("PA" + std::to_string(i));
+                        IdString mult_a = ctx->id("A" + std::to_string(i));
+                        if (ci->ports.count(pradd_pa) && ci->ports[pradd_pa].net) {
+                            NetInfo *net = ci->ports[pradd_pa].net;
+                            ci->disconnectPort(pradd_pa);
+                            if (!mult->ports.count(mult_a)) {
+                                mult->addInput(mult_a);
+                            }
+                            mult->connectPort(mult_a, net);
+                        }
+                    }
+
+                    // PRADD PB inputs depend on SOURCEB_MODE parameter:
+                    // - PARALLEL: Route PB through MULT B pins (share physical routing)
+                    // - SHIFT: PB comes from SRI chain (internal, no external routing)
+                    // - INTERNAL: PB comes from internal feedback (no external routing)
+                    std::string sourceb_mode = str_or_default(ci->params, id_SOURCEB_MODE, "PARALLEL");
+
+                    if (sourceb_mode == "PARALLEL") {
+                        // Route PRADD.PB through MULT.B (they share physical pins in hardware)
+                        for (int i = 0; i < 18; i++) {
+                            IdString pradd_pb = ctx->id("PB" + std::to_string(i));
+                            IdString mult_b = ctx->id("B" + std::to_string(i));
+                            if (ci->ports.count(pradd_pb) && ci->ports[pradd_pb].net) {
+                                NetInfo *net = ci->ports[pradd_pb].net;
+                                ci->disconnectPort(pradd_pb);
+                                // Disconnect existing MULT.B if connected (PRADD PB takes priority)
+                                if (mult->ports.count(mult_b) && mult->ports[mult_b].net) {
+                                    mult->disconnectPort(mult_b);
+                                }
+                                if (!mult->ports.count(mult_b)) {
+                                    mult->addInput(mult_b);
+                                }
+                                mult->connectPort(mult_b, net);
+                            }
+                        }
+                    } else {
+                        // SHIFT or INTERNAL mode: PB comes from internal sources, disconnect external
+                        for (int i = 0; i < 18; i++) {
+                            IdString pradd_pb = ctx->id("PB" + std::to_string(i));
+                            if (ci->ports.count(pradd_pb) && ci->ports[pradd_pb].net) {
+                                ci->disconnectPort(pradd_pb);
+                            }
+                        }
+                    }
+
+                    // Disconnect all remaining PRADD ports cleanly
+                    for (auto &port : ci->ports) {
+                        if (port.second.net != nullptr) {
+                            ci->disconnectPort(port.first);
+                        }
+                    }
+
+                    log_info("DSP: Absorbing PRADD18A '%s' into MULT18X18 '%s'\n",
+                             ci->name.c_str(ctx), mult->name.c_str(ctx));
+
+                    // Mark PRADD18A cell for removal
+                    packed_cells.insert(ci->name);
+                } else {
+                    log_error("PRADD18A '%s' must have PO output connected to MULT18X18D/C A input\n",
+                              ci->name.c_str(ctx));
+                }
+            } else if (ci->type == id_PRADD9A) {
+                // PRADD9A is similar to PRADD18A but with 9-bit ports
+                for (auto sig : {"CLK", "CE", "RST"})
+                    for (int i = 0; i < 4; i++)
+                        autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
+                // PRADD9A uses PA, PB for preadder inputs (not A, B)
+                for (auto port : {"PA", "PB"})
+                    for (int i = 0; i < 9; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+                for (auto port : {"SRIA", "SRIB", "SROA", "SROB"})
+                    for (int i = 0; i < 9; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+                for (int i = 0; i < 9; i++)
+                    autocreate_empty_port(ci, ctx->id("PO" + std::to_string(i)));
+                // OPPRE - single-bit output path register bypass control
+                autocreate_empty_port(ci, ctx->id("OPPRE"));
+                autocreate_empty_port(ci, id_SIGNEDA);
+                autocreate_empty_port(ci, id_SIGNEDB);
+                autocreate_empty_port(ci, id_SOURCEA);
+                autocreate_empty_port(ci, id_SOURCEB);
+
+                // Find the MULT9X9D/C that this PRADD9A feeds
+                CellInfo *mult = nullptr;
+                NetInfo *net = ci->ports.count(id_PO0) ? ci->ports.at(id_PO0).net : nullptr;
+                if (net != nullptr) {
+                    for (auto &user : net->users) {
+                        if ((user.cell->type == id_MULT9X9D || user.cell->type == id_MULT9X9C) && user.port == id_A0) {
+                            mult = user.cell;
+                            break;
+                        }
+                    }
+                }
+
+                if (mult != nullptr) {
+                    // Absorb PRADD9A into the MULT9X9D cell (same approach as PRADD18A)
+                    for (auto &param : ci->params) {
+                        mult->params[ctx->id("PRADD_" + param.first.str(ctx))] = param.second;
+                    }
+                    mult->params[ctx->id("HAS_PRADD")] = Property("TRUE");
+
+                    // Disconnect MULT A from PRADD PO net
+                    for (int i = 0; i < 9; i++) {
+                        IdString mult_a_port = ctx->id("A" + std::to_string(i));
+                        if (mult->ports.count(mult_a_port) && mult->ports[mult_a_port].net) {
+                            mult->disconnectPort(mult_a_port);
+                        }
+                    }
+
+                    // Transfer PRADD PA inputs to MULT A ports
+                    for (int i = 0; i < 9; i++) {
+                        IdString pradd_pa = ctx->id("PA" + std::to_string(i));
+                        IdString mult_a = ctx->id("A" + std::to_string(i));
+                        if (ci->ports.count(pradd_pa) && ci->ports[pradd_pa].net) {
+                            NetInfo *net = ci->ports[pradd_pa].net;
+                            ci->disconnectPort(pradd_pa);
+                            if (!mult->ports.count(mult_a)) {
+                                mult->addInput(mult_a);
+                            }
+                            mult->connectPort(mult_a, net);
+                        }
+                    }
+
+                    // PRADD9A PB inputs depend on SOURCEB_MODE parameter:
+                    // - PARALLEL: Route PB through MULT B pins (share physical routing)
+                    // - SHIFT: PB comes from SRI chain (internal, no external routing)
+                    std::string sourceb_mode = str_or_default(ci->params, id_SOURCEB_MODE, "PARALLEL");
+
+                    if (sourceb_mode == "PARALLEL") {
+                        // Route PRADD.PB through MULT.B (they share physical pins in hardware)
+                        for (int i = 0; i < 9; i++) {
+                            IdString pradd_pb = ctx->id("PB" + std::to_string(i));
+                            IdString mult_b = ctx->id("B" + std::to_string(i));
+                            if (ci->ports.count(pradd_pb) && ci->ports[pradd_pb].net) {
+                                NetInfo *net = ci->ports[pradd_pb].net;
+                                ci->disconnectPort(pradd_pb);
+                                // Disconnect existing MULT.B if connected
+                                if (mult->ports.count(mult_b) && mult->ports[mult_b].net) {
+                                    mult->disconnectPort(mult_b);
+                                }
+                                if (!mult->ports.count(mult_b)) {
+                                    mult->addInput(mult_b);
+                                }
+                                mult->connectPort(mult_b, net);
+                            }
+                        }
+                    } else {
+                        // SHIFT or INTERNAL mode: PB comes from internal sources
+                        for (int i = 0; i < 9; i++) {
+                            IdString pradd_pb = ctx->id("PB" + std::to_string(i));
+                            if (ci->ports.count(pradd_pb) && ci->ports[pradd_pb].net) {
+                                ci->disconnectPort(pradd_pb);
+                            }
+                        }
+                    }
+
+                    // Disconnect all remaining PRADD ports
+                    for (auto &port : ci->ports) {
+                        if (port.second.net != nullptr) {
+                            ci->disconnectPort(port.first);
+                        }
+                    }
+
+                    log_info("DSP: Absorbing PRADD9A '%s' into MULT9X9 '%s'\n",
+                             ci->name.c_str(ctx), mult->name.c_str(ctx));
+                    packed_cells.insert(ci->name);
+                } else {
+                    log_error("PRADD9A '%s' must have PO output connected to MULT9X9D/C A input\n",
+                              ci->name.c_str(ctx));
+                }
+            } else if (ci->type == id_ALU54B || ci->type == id_ALU54A) {
+                // ALU54A is simplified version without CFB, CO, CLK_DIV - maps to same hardware
+                // Convert ALU54A to ALU54B for placement (hardware is the same)
+                if (ci->type == id_ALU54A)
+                    ci->type = id_ALU54B;
                 for (auto sig : {"CLK", "CE", "RST"})
                     for (int i = 0; i < 4; i++)
                         autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
@@ -1202,13 +1656,15 @@ class Ecp5Packer
                 for (int i = 0; i < 11; i++)
                     autocreate_empty_port(ci, ctx->id("OP" + std::to_string(i)));
 
-                // Find the MULT18X18Ds feeding this ALU54B's MA and MB inputs.
+                // Find the MULT18X18D/C cells feeding this ALU54's MA and MB inputs.
                 CellInfo *mult_a = nullptr;
                 CellInfo *mult_b = nullptr;
                 for (auto port : {id_MA0, id_MB0}) {
                     CellInfo *mult = net_driven_by(
                             ctx, ci->ports.at(port).net,
-                            [](const Context *ctx, const CellInfo *cell) { return cell->type == id_MULT18X18D; },
+                            [](const Context *ctx, const CellInfo *cell) {
+                                return cell->type == id_MULT18X18D || cell->type == id_MULT18X18C;
+                            },
                             id_P0);
 
                     // We'll handle the mult not existing in check_alu below.
@@ -1230,12 +1686,159 @@ class Ecp5Packer
                     ci->constr_z = 0;
                     ci->cluster = ci->name;
                     ci->constr_children.push_back(mult);
-                    log_info("DSP: Constraining MULT18X18D '%s' to ALU54B '%s' port %s\n", mult->name.c_str(ctx),
+                    log_info("DSP: Constraining MULT18X18 '%s' to ALU54 '%s' port %s\n", mult->name.c_str(ctx),
                              cell.first.c_str(ctx), ctx->nameOf(port));
                 }
 
                 // Check existance of, and connectivity to, each MULT.
                 check_alu(ci, mult_a, mult_b);
+            } else if (ci->type == id_ALU24B || ci->type == id_ALU24A) {
+                // ALU24B/A packing - requires paired MULT9X9 cells
+                // ALU24A is simplified version without CFB, CO, CLK_DIV - maps to same hardware
+                // Convert ALU24A to ALU24B for placement (hardware is the same)
+                if (ci->type == id_ALU24A)
+                    ci->type = id_ALU24B;
+                // ALU24 MA/MB inputs MUST come from MULT P outputs (hardware constraint)
+                for (auto sig : {"CLK", "CE", "RST"})
+                    for (int i = 0; i < 4; i++)
+                        autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
+
+                autocreate_empty_port(ci, id_SIGNEDIA);
+                autocreate_empty_port(ci, id_SIGNEDIB);
+                autocreate_empty_port(ci, id_CIN);
+
+                // MA/MB inputs (18 bits each from MULT9 P outputs)
+                for (auto port : {"MA", "MB"})
+                    for (int i = 0; i < 18; i++)
+                        autocreate_empty_port(ci, ctx->id(port + std::to_string(i)));
+
+                // CFB input (24 bits)
+                for (int i = 0; i < 24; i++)
+                    autocreate_empty_port(ci, ctx->id("CFB" + std::to_string(i)));
+
+                // R output (24 bits)
+                for (int i = 0; i < 24; i++)
+                    autocreate_empty_port(ci, ctx->id("R" + std::to_string(i)));
+
+                // Opcode inputs (3 bits)
+                for (int i = 0; i < 3; i++)
+                    autocreate_empty_port(ci, ctx->id("OP" + std::to_string(i)));
+
+                // CO output (24 bits for ALU24B)
+                for (int i = 0; i < 24; i++)
+                    autocreate_empty_port(ci, ctx->id("CO" + std::to_string(i)));
+
+                // Find the MULT9X9D/C cells feeding this ALU24's MA and MB inputs
+                CellInfo *mult_a = nullptr;
+                CellInfo *mult_b = nullptr;
+
+                for (auto port : {id_MA0, id_MB0}) {
+                    CellInfo *mult = net_driven_by(
+                            ctx, ci->ports.at(port).net,
+                            [](const Context *ctx, const CellInfo *cell) {
+                                return cell->type == id_MULT9X9D || cell->type == id_MULT9X9C ||
+                                       cell->type == id_MULT18X18D || cell->type == id_MULT18X18C;
+                            },
+                            id_P0);
+
+                    if (mult == nullptr)
+                        break;
+
+                    // Set relative constraint depending on ALU port
+                    if (port == id_MA0) {
+                        mult->constr_x = mult->constr_z = -3;
+                        mult_a = mult;
+                    } else if (port == id_MB0) {
+                        mult->constr_x = mult->constr_z = -2;
+                        mult_b = mult;
+                    }
+                    mult->constr_y = 0;
+                    mult->cluster = ci->name;
+                    ci->constr_x = 0;
+                    ci->constr_y = 0;
+                    ci->constr_z = 0;
+                    ci->cluster = ci->name;
+                    ci->constr_children.push_back(mult);
+                    log_info("DSP: Constraining MULT '%s' to ALU24 '%s' port %s\n", mult->name.c_str(ctx),
+                             cell.first.c_str(ctx), ctx->nameOf(port));
+                }
+
+                // Check ALU24 connectivity
+                check_alu24b(ci, mult_a, mult_b);
+
+                // Mark original type for bitstream generator before converting for placement
+                ci->attrs[ctx->id("ORIGINAL_TYPE")] = Property(std::string("ALU24B"));
+
+                // Convert ALU24B to ALU54B for placement (ALU24 uses ALU54 hardware)
+                ci->type = id_ALU54B;
+            }
+        }
+        // Flush packed cells (PRADD cells absorbed into MULT)
+        flush_cells();
+    }
+
+    // Check ALU24B is correctly connected to MULT9X9D/MULT18X18D cells
+    void check_alu24b(CellInfo *alu, CellInfo *mult_a, CellInfo *mult_b)
+    {
+        // MULT cells must be detected on both inputs
+        if (mult_a == nullptr) {
+            log_error("No MULT9X9D/MULT18X18D found connected to ALU24B '%s' port MA\n", alu->name.c_str(ctx));
+        } else if (mult_b == nullptr) {
+            log_error("No MULT9X9D/MULT18X18D found connected to ALU24B '%s' port MB\n", alu->name.c_str(ctx));
+        }
+
+        // Placement doesn't work if only one or the other of the ALU and MULTs have a BEL specified
+        auto alu_has_bel = alu->attrs.count(id_BEL);
+        for (auto mult : {mult_a, mult_b}) {
+            auto mult_has_bel = mult->attrs.count(id_BEL);
+            if (alu_has_bel && !mult_has_bel) {
+                log_error("ALU24B '%s' has a fixed BEL specified, but connected "
+                          "MULT '%s' does not, specify both or neither.\n",
+                          alu->name.c_str(ctx), mult->name.c_str(ctx));
+            } else if (!alu_has_bel && mult_has_bel) {
+                log_error("ALU24B '%s' does not have a fixed BEL specified, but "
+                          "connected MULT '%s' does, specify both or neither.\n",
+                          alu->name.c_str(ctx), mult->name.c_str(ctx));
+            }
+        }
+
+        // Cannot have MULT OUTPUT_CLK set when connected to an ALU unless MULT_BYPASS is also enabled
+        for (auto mult : {mult_a, mult_b}) {
+            if (str_or_default(mult->params, id_REG_OUTPUT_CLK, "NONE") != "NONE" &&
+                str_or_default(mult->params, id_MULT_BYPASS, "DISABLED") != "ENABLED") {
+                log_error("MULT '%s' REG_OUTPUT_CLK must be NONE when driving ALU24B without MULT_BYPASS\n",
+                          mult->name.c_str(ctx));
+            }
+        }
+
+        // SIGNEDIA and SIGNEDIB inputs must be connected to SIGNEDP output
+        NetInfo *net = alu->ports.at(id_SIGNEDIA).net;
+        if (net == nullptr || net->driver.cell != mult_a || net->driver.port != id_SIGNEDP) {
+            log_error("ALU24B '%s' input SIGNEDIA must be driven by SIGNEDP of MULT '%s'\n",
+                      alu->name.c_str(ctx), mult_a->name.c_str(ctx));
+        }
+        net = alu->ports.at(id_SIGNEDIB).net;
+        if (net == nullptr || net->driver.cell != mult_b || net->driver.port != id_SIGNEDP) {
+            log_error("ALU24B '%s' input SIGNEDIB must be driven by SIGNEDP of MULT '%s'\n",
+                      alu->name.c_str(ctx), mult_b->name.c_str(ctx));
+        }
+
+        // All MA and MB inputs must be connected to P outputs
+        for (int i = 0; i < 18; i++) {
+            IdString mult_port = ctx->id(std::string("P") + std::to_string(i));
+
+            IdString alu_port = ctx->id(std::string("MA") + std::to_string(i));
+            net = alu->ports.at(alu_port).net;
+            if (net == nullptr || net->driver.cell != mult_a || net->driver.port != mult_port) {
+                log_error("ALU24B '%s' input %s must be driven by %s of MULT '%s'\n", alu->name.c_str(ctx),
+                          alu_port.c_str(ctx), mult_port.c_str(ctx), mult_a->name.c_str(ctx));
+            }
+
+            alu_port = ctx->id(std::string("MB") + std::to_string(i));
+            net = alu->ports.at(alu_port).net;
+            if (net == nullptr || net->driver.cell != mult_b || net->driver.port != mult_port) {
+                log_error("ALU24B '%s' input %s must be driven by %s of MULT '%s'\n", alu->name.c_str(ctx),
+                          alu_port.c_str(ctx), mult_port.c_str(ctx), mult_b->name.c_str(ctx));
             }
         }
     }
