@@ -1197,8 +1197,9 @@ struct ECP5Bitgen
         tg.config.add_enum(dsp + ".CAS_MATCH_REG", str_or_default(ci->params, ctx->id("CAS_MATCH_REG"), "FALSE"));
         tg.config.add_enum(dsp + ".MULT_BYPASS", str_or_default(ci->params, ctx->id("MULT_BYPASS"), "DISABLED"));
         tg.config.add_enum(dsp + ".HIGHSPEED_CLK", str_or_default(ci->params, ctx->id("HIGHSPEED_CLK"), "NONE"));
-        // Present in vendor primitives and Trellis fuzzers, but the distributed DB may not include it yet.
-        tg.config.add_enum(dsp + ".MULT9_MODE", str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED"));
+        // MULT9_MODE is simulation-only — no CRAM bit exists. The hardware auto-detects 9x9 mode
+        // based on which routing arcs (MULT9 vs MULT18 product wires) are connected to the ALU.
+        // Confirmed by comparing FillAlu54Mult9Mode vs FillAlu54FullPipe: byte-identical bitstreams.
         tg.config.add_enum(dsp + ".SOURCEB_MODE", str_or_default(ci->params, id_SOURCEB_MODE, "B_SHIFT"));
         tg.config.add_enum(dsp + ".RESETMODE", str_or_default(ci->params, id_RESETMODE, "SYNC"));
 
@@ -1219,39 +1220,16 @@ struct ECP5Bitgen
             }
         }
 
-        // Check if PRADD18A was absorbed into this MULT
-        if (str_or_default(ci->params, ctx->id("HAS_PRADD"), "FALSE") == "TRUE") {
-            // PRADD18 index is 0 or 1 depending on which half of the DSP block
-            // MULT z=0,4 → PRADD18_0; MULT z=1,5 → PRADD18_1
-            int pradd_idx = (loc.z == 1 || loc.z == 5) ? 1 : 0;
-            std::string pradd = "PRADD18_" + std::to_string(pradd_idx);
-
-            // Get PRADD parameters (stored with PRADD_ prefix)
-            tg.config.add_enum(pradd + ".SOURCEA_MODE",
-                               str_or_default(ci->params, ctx->id("PRADD_SOURCEA_MODE"), "A_SHIFT"));
-            tg.config.add_enum(pradd + ".SOURCEB_MODE",
-                               str_or_default(ci->params, ctx->id("PRADD_SOURCEB_MODE"), "PARALLEL"));
-            tg.config.add_enum(pradd + ".FB_MUX",
-                               str_or_default(ci->params, ctx->id("PRADD_FB_MUX"), "DISABLED"));
-            tg.config.add_enum(pradd + ".SYMMETRY_MODE",
-                               str_or_default(ci->params, ctx->id("PRADD_SYMMETRY_MODE"), "DIRECT"));
-            tg.config.add_enum(pradd + ".REG_OPPRE_CLK",
-                               str_or_default(ci->params, ctx->id("PRADD_REG_OPPRE_CLK"), "NONE"));
-            tg.config.add_enum(pradd + ".REG_INPUTA_CLK",
-                               str_or_default(ci->params, ctx->id("PRADD_REG_INPUTA_CLK"), "NONE"));
-            tg.config.add_enum(pradd + ".REG_INPUTB_CLK",
-                               str_or_default(ci->params, ctx->id("PRADD_REG_INPUTB_CLK"), "NONE"));
-            tg.config.add_enum(pradd + ".RESETMODE",
-                               str_or_default(ci->params, ctx->id("PRADD_RESETMODE"), "SYNC"));
-            tg.config.add_enum(pradd + ".GSR",
-                               str_or_default(ci->params, ctx->id("PRADD_GSR"), "ENABLED"));
-        }
+        // PRADD18A/PRADD9A config is emitted below via emit_pradd_cfg() after the
+        // MULT9 block. The absorbed PRADD params (prefixed PRADD18_ or PRADD9_ on the
+        // MULT cell) are read by the lambda and written to the tilegroup config.
 
         tieoff_dsp_ports(ci);
 
-        // Optional MULT9 mode emission (placeholder): if a design was packed into MULT18 with MULT9 mode enabled,
-        // emit a MULT9_* config block too, matching the trellis fuzzer naming. This will only take effect once
-        // the DB has corresponding entries.
+        // Optional MULT9 config block (placeholder). MULT9_MODE has no CRAM bit — hardware auto-detects
+        // 9x9 mode via routing. This block emits MULT9_* entries matching the trellis fuzzer naming
+        // convention, but ecppack will silently discard them unless MULT9_* entries are added to bits.db.
+        // Kept as documentation of the intended MULT9 config structure.
         const bool mult9_enabled = str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED") != "DISABLED" ||
                                    bool_or_default(ci->attrs, ctx->id("MULT9X9D_USED"), false);
         if (mult9_enabled) {
@@ -1286,7 +1264,9 @@ struct ECP5Bitgen
             const std::string mode = is_pradd9 ? "PRADD9A" : "PRADD18A";
             const std::string inst = pr + std::to_string(loc.z);
 
-            tg.config.add_enum(inst + ".MODE", mode);
+            // PRADD*.MODE not yet in bits.db — skip to avoid ecppack error.
+            // PRADD config is activated by setting source modes and register CLKs.
+            // tg.config.add_enum(inst + ".MODE", mode);
 
             auto penum = [&](const std::string &name, const std::string &defval) {
                 tg.config.add_enum(inst + "." + name, str_or_default(ci->params, ctx->id(prpfx + name), defval));
@@ -1323,6 +1303,8 @@ struct ECP5Bitgen
             bool_or_default(ci->attrs, ctx->id("PRADD9A_USED"), false)) {
             enable_pradd18a_mux(ci, /*bit=*/0);
         }
+        // Emit full PRADD config block now that bits.db has PRADD18_0 entries
+        // (mirrored from PRADD9_0 — they share physical hardware register muxes).
         if (bool_or_default(ci->attrs, ctx->id("PRADD18A_USED"), false))
             emit_pradd_cfg(/*is_pradd9=*/false);
         if (bool_or_default(ci->attrs, ctx->id("PRADD9A_USED"), false))
@@ -1375,8 +1357,7 @@ struct ECP5Bitgen
         tg.config.add_enum(dsp + ".FORCE_ZERO_BARREL_SHIFT",
                            str_or_default(ci->params, id_FORCE_ZERO_BARREL_SHIFT, "DISABLED"));
         tg.config.add_enum(dsp + ".LEGACY", str_or_default(ci->params, id_LEGACY, "DISABLED"));
-        // Present in vendor primitives and Trellis fuzzers, but the distributed DB may not include it yet.
-        tg.config.add_enum(dsp + ".MULT9_MODE", str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED"));
+        // MULT9_MODE is simulation-only — no CRAM bit exists. Hardware auto-detects based on routing.
 
         tg.config.add_enum(dsp + ".MODE", "ALU54B");
 

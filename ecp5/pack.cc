@@ -1331,22 +1331,59 @@ class Ecp5Packer
                     mult->disconnectPort(ctx->id("A" + std::to_string(i)));
                 }
 
-                // Merge PRADD inputs: PA*, PB*, and OPPRE.
-                for (auto bus : {"PA", "PB"}) {
+                // Merge PRADD inputs: PA* -> MULT A*, PB* -> MULT B* (for PARALLEL), OPPRE.
+                //
+                // In ECP5 hardware, PRADD PA and MULT A share the same physical pins.
+                // PRADD PB and MULT B also share physical pins when SOURCEB_MODE="PARALLEL".
+                // Map PA->A on the MULT (PO->A internal connection was already disconnected above).
+                for (int i = 0; i < pr_width; i++) {
+                    IdString pa = ctx->id("PA" + std::to_string(i));
+                    IdString a = ctx->id("A" + std::to_string(i));
+                    NetInfo *n = pradd->getPort(pa);
+                    if (n == nullptr)
+                        continue;
+                    autocreate_empty_port(mult, a);
+                    mult->connectPort(a, n);
+                }
+
+                // Handle PB depending on SOURCEB_MODE
+                std::string sourceb = str_or_default(pradd->params, id_SOURCEB_MODE, "PARALLEL");
+                if (sourceb == "PARALLEL") {
+                    // PB shares physical pins with MULT B - transfer PB nets to MULT B ports
                     for (int i = 0; i < pr_width; i++) {
-                        IdString p = ctx->id(std::string(bus) + std::to_string(i));
-                        NetInfo *n = pradd->getPort(p);
+                        IdString pb = ctx->id("PB" + std::to_string(i));
+                        IdString b = ctx->id("B" + std::to_string(i));
+                        NetInfo *n = pradd->getPort(pb);
                         if (n == nullptr)
                             continue;
-                        autocreate_empty_port(mult, p);
-                        mult->connectPort(p, n);
+                        // Disconnect existing MULT B if connected (PB takes priority in hardware)
+                        if (mult->ports.count(b) && mult->ports[b].net)
+                            mult->disconnectPort(b);
+                        autocreate_empty_port(mult, b);
+                        mult->connectPort(b, n);
                     }
                 }
+                // For SHIFT/INTERNAL modes, PB comes from internal sources - no external routing needed.
+
+                // OPPRE (dynamic add/subtract control).
+                // The MULT18X18D bel has no OPPRE physical pin — it exists only on the PRADD bel.
+                // For constant OPPRE (tied to VLO/VHI), we store the value in PRADD params (already
+                // preserved above) and the bitstream code emits the appropriate static configuration.
+                // For dynamic OPPRE, a future revision would need to keep the PRADD bel placed
+                // alongside the MULT and route OPPRE through the PRADD bel's pin.
                 {
                     NetInfo *n = pradd->getPort(id_OPPRE);
                     if (n != nullptr) {
-                        autocreate_empty_port(mult, id_OPPRE);
-                        mult->connectPort(id_OPPRE, n);
+                        bool is_const = (n->constant_value != IdString()) ||
+                                        (n->driver.cell != nullptr && n->driver.cell->type.in(id_GND, id_VCC,
+                                         ctx->id("VLO"), ctx->id("VHI")));
+                        if (!is_const) {
+                            // Dynamic OPPRE requires routing through the PRADD bel — not yet supported.
+                            log_error("PRADD18A '%s' has dynamic OPPRE; only constant OPPRE is supported\n",
+                                      pradd->name.c_str(ctx));
+                        }
+                        // Constant OPPRE: store value in PRADD params, don't create port on MULT
+                        // (the bitstream code reads PRADD_ params directly)
                     }
                 }
 
@@ -1361,6 +1398,37 @@ class Ecp5Packer
                 packed_cells.insert(pradd->name);
             }
             flush_cells();
+        }
+
+        // Disconnect constant-driven DSP data inputs.
+        // In ECP5 DSP blocks, unused data inputs (A, B, C, SRI, CIN, PB, etc.)
+        // are often tied to VLO/GND in the Verilog. However, nextpnr tries to route
+        // these through fabric, which fails on many DSP sites. The bitstream
+        // tieoff_dsp_ports() function handles unconnected ports by setting CIB tie-offs
+        // directly, so disconnecting constant-driven ports is safe and correct.
+        for (auto &cell : ctx->cells) {
+            CellInfo *ci = cell.second.get();
+            if (!ci->type.in(id_MULT18X18D, id_MULT18X18C, id_ALU54B, id_ALU54A, id_ALU24B, id_ALU24A))
+                continue;
+            std::vector<IdString> to_disconnect;
+            for (auto &port : ci->ports) {
+                if (port.second.type != PORT_IN || port.second.net == nullptr)
+                    continue;
+                NetInfo *net = port.second.net;
+                // Check if driven by a constant cell (GND/VCC/VLO/VHI)
+                if (net->driver.cell == nullptr)
+                    continue;
+                if (!net->driver.cell->type.in(id_GND, id_VCC, ctx->id("VLO"), ctx->id("VHI")))
+                    continue;
+                // Don't disconnect CLK/CE/RST — they need real routing for mux selection
+                std::string pname = port.first.str(ctx);
+                if (pname.substr(0, 3) == "CLK" || pname.substr(0, 2) == "CE" ||
+                    pname.substr(0, 3) == "RST")
+                    continue;
+                to_disconnect.push_back(port.first);
+            }
+            for (IdString p : to_disconnect)
+                ci->disconnectPort(p);
         }
 
         for (auto &cell : ctx->cells) {
