@@ -491,16 +491,21 @@ struct ECP5Bitgen
     {
         for (auto port : ci->ports) {
             if (port.second.net == nullptr && port.second.type == PORT_IN) {
-                if (port.first.str(ctx).substr(0, 3) == "CLK" || port.first.str(ctx).substr(0, 2) == "CE" ||
-                    port.first.str(ctx).substr(0, 3) == "RST" || port.first.str(ctx).substr(0, 3) == "SRO" ||
-                    port.first.str(ctx).substr(0, 3) == "SRI" || port.first.str(ctx).substr(0, 2) == "RO" ||
-                    port.first.str(ctx).substr(0, 2) == "MA" || port.first.str(ctx).substr(0, 2) == "MB" ||
-                    port.first.str(ctx).substr(0, 3) == "CFB" || port.first.str(ctx).substr(0, 3) == "CIN" ||
-                    port.first.str(ctx).substr(0, 6) == "SOURCE" || port.first.str(ctx).substr(0, 6) == "SIGNED" ||
-                    port.first.str(ctx).substr(0, 2) == "OP")
+                std::string name = port.first.str(ctx);
+                if (name.substr(0, 3) == "CLK" || name.substr(0, 2) == "CE" ||
+                    name.substr(0, 3) == "RST" || name.substr(0, 3) == "SRO" ||
+                    name.substr(0, 3) == "SRI" || name.substr(0, 2) == "RO" ||
+                    name.substr(0, 2) == "MA" || name.substr(0, 2) == "MB" ||
+                    name.substr(0, 3) == "CFB" || name.substr(0, 3) == "CIN" ||
+                    name.substr(0, 2) == "CO" ||
+                    name.substr(0, 6) == "SOURCE" || name.substr(0, 6) == "SIGNED" ||
+                    name.substr(0, 2) == "OP")
                     continue;
-                bool value = bool_or_default(ci->params, ctx->id(port.first.str(ctx) + "MUX"), false);
-                tie_cib_signal(ctx->getBelPinWire(ci->bel, port.first), value);
+                WireId wire = ctx->getBelPinWire(ci->bel, port.first);
+                if (wire == WireId())
+                    continue;
+                bool value = bool_or_default(ci->params, ctx->id(name + "MUX"), false);
+                tie_cib_signal(wire, value);
             }
         }
     }
@@ -1226,34 +1231,8 @@ struct ECP5Bitgen
 
         tieoff_dsp_ports(ci);
 
-        // Optional MULT9 config block (placeholder). MULT9_MODE has no CRAM bit — hardware auto-detects
-        // 9x9 mode via routing. This block emits MULT9_* entries matching the trellis fuzzer naming
-        // convention, but ecppack will silently discard them unless MULT9_* entries are added to bits.db.
-        // Kept as documentation of the intended MULT9 config structure.
-        const bool mult9_enabled = str_or_default(ci->params, ctx->id("MULT9_MODE"), "DISABLED") != "DISABLED" ||
-                                   bool_or_default(ci->attrs, ctx->id("MULT9X9D_USED"), false);
-        if (mult9_enabled) {
-            const std::string m9 = "MULT9_" + std::to_string(loc.z);
-            tg.config.add_enum(m9 + ".MODE", "MULT9X9D");
-
-            auto m9enum = [&](const std::string &name, const std::string &defval) {
-                tg.config.add_enum(m9 + "." + name, str_or_default(ci->params, ctx->id(name), defval));
-            };
-
-            for (auto reg : {"INPUTA", "INPUTB", "INPUTC", "PIPELINE", "OUTPUT"}) {
-                m9enum(std::string("REG_") + reg + "_CLK", "NONE");
-                m9enum(std::string("REG_") + reg + "_CE", "CE0");
-                m9enum(std::string("REG_") + reg + "_RST", "RST0");
-            }
-            for (auto clk : {"CLK0", "CLK1", "CLK2", "CLK3"})
-                m9enum(std::string(clk) + "_DIV", "ENABLED");
-            m9enum("CAS_MATCH_REG", "FALSE");
-            m9enum("MULT_BYPASS", "DISABLED");
-            m9enum("GSR", "ENABLED");
-            m9enum("RESETMODE", "SYNC");
-            m9enum("SOURCEB_MODE", "B_SHIFT");
-            m9enum("HIGHSPEED_CLK", "NONE");
-        }
+        // MULT9_MODE has no CRAM bit — hardware auto-detects 9x9 mode via routing.
+        // No MULT9_* config entries are emitted; the MULT18 config block covers everything.
 
         // If PRADD was packed into this MULT, emit the PRADD config block too.
         // This is required to later enable true PRADD behavior once the Trellis DB
@@ -1264,31 +1243,32 @@ struct ECP5Bitgen
             const std::string mode = is_pradd9 ? "PRADD9A" : "PRADD18A";
             const std::string inst = pr + std::to_string(loc.z);
 
-            // PRADD*.MODE not yet in bits.db — skip to avoid ecppack error.
-            // PRADD config is activated by setting source modes and register CLKs.
-            // tg.config.add_enum(inst + ".MODE", mode);
+            tg.config.add_enum(inst + ".MODE", mode);
 
             auto penum = [&](const std::string &name, const std::string &defval) {
                 tg.config.add_enum(inst + "." + name, str_or_default(ci->params, ctx->id(prpfx + name), defval));
             };
 
             // Register controls
-            for (auto reg : {"INPUTA", "INPUTB", "INPUTC"}) {
+            for (auto reg : {"INPUTA", "INPUTB"}) {
                 penum(std::string("REG_") + reg + "_CLK", "NONE");
                 penum(std::string("REG_") + reg + "_CE", "CE0");
                 penum(std::string("REG_") + reg + "_RST", "RST0");
             }
+            // INPUTC CE/RST share hardware with paired MULT18 — only CLK has separate PRADD bits
+            penum("REG_INPUTC_CLK", "NONE");
             penum("REG_OPPRE_CLK", "NONE");
             penum("REG_OPPRE_CE", "CE0");
             penum("REG_OPPRE_RST", "RST0");
 
-            // Misc controls
+            // Misc controls (CAS_MATCH_REG shares hardware with paired MULT18)
             penum("GSR", "ENABLED");
-            penum("CAS_MATCH_REG", "FALSE");
             penum("RESETMODE", "SYNC");
             penum("SOURCEA_MODE", "A_SHIFT");
             penum("SOURCEB_MODE", "SHIFT");
-            penum("FB_MUX", "SHIFT");
+            // FB_MUX only exists for the second instance in each half (z=1,5)
+            if (!is_pradd9 && (loc.z == 1 || loc.z == 5))
+                penum("FB_MUX", "SHIFT");
             penum("SYMMETRY_MODE", "DIRECT");
             penum("HIGHSPEED_CLK", "NONE");
 
@@ -1415,20 +1395,21 @@ struct ECP5Bitgen
     void write_alu24b(CellInfo *ci)
     {
         // ALU24B uses the ALU54 hardware with MODE=ALU54B
-        // Placed at ALU24_RxxCxx sites which map to ALU54_7 internally
+        // Can be placed at ALU54_3 (left) or ALU54_7 (right) depending on BEL
         TileGroup tg;
         Loc loc = ctx->getBelLocation(ci->bel);
         tg.tiles = get_dsp_tiles(ci->bel);
 
-        // ALU24B always uses ALU54_7 position in the DSP block
-        std::string dsp = "ALU54_7";
+        // Determine ALU54 instance from BEL z coordinate
+        std::string dsp = "ALU54_" + std::to_string(loc.z);
+        bool is_right = (loc.z == 7);
 
         // Set mode to ALU54B (shared with ALU24B)
         tg.config.add_enum(dsp + ".MODE", "ALU54B");
 
         // Output register control (ALU24B has R[23:0] output)
         tg.config.add_enum(dsp + ".REG_OUTPUT0_CLK", str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE"));
-        tg.config.add_enum(dsp + ".REG_OUTPUT0_CE", str_or_default(ci->params, id_REG_OUTPUT_CE, "CE0"));
+        // REG_OUTPUT0_CE not in DB yet (fuzzer 079 only varied CLK); hardware defaults to CE0
         tg.config.add_enum(dsp + ".REG_OUTPUT0_RST", str_or_default(ci->params, id_REG_OUTPUT_RST, "RST0"));
         tg.config.add_enum(dsp + ".REG_OUTPUT1_CLK", "NONE");
         tg.config.add_enum(dsp + ".REG_OUTPUT1_RST", "RST0");
@@ -1475,11 +1456,11 @@ struct ECP5Bitgen
         tg.config.add_enum(dsp + ".LEGACY", "DISABLED");
 
         // Enable DSP output routing
-        tg.config.add_enum("DSP_RIGHT.CIBOUT", "ON");
+        tg.config.add_enum(is_right ? "DSP_RIGHT.CIBOUT" : "DSP_LEFT.CIBOUT", "ON");
 
         // CIBOUT_BYP for unregistered output
         if (str_or_default(ci->params, id_REG_OUTPUT_CLK, "NONE") == "NONE") {
-            tg.config.add_enum("MULT18_4.CIBOUT_BYP", "ON");
+            tg.config.add_enum(is_right ? "MULT18_4.CIBOUT_BYP" : "MULT18_0.CIBOUT_BYP", "ON");
         }
 
         tieoff_dsp_ports(ci);
@@ -1499,7 +1480,9 @@ struct ECP5Bitgen
         // PRADD18A-specific parameters
         tg.config.add_enum(dsp + ".SOURCEA_MODE", str_or_default(ci->params, id_SOURCEA_MODE, "A_SHIFT"));
         tg.config.add_enum(dsp + ".SOURCEB_MODE", str_or_default(ci->params, id_SOURCEB_MODE, "PARALLEL"));
-        tg.config.add_enum(dsp + ".FB_MUX", str_or_default(ci->params, id_FB_MUX, "DISABLED"));
+        // FB_MUX only exists for the second instance in each half (z=1,5)
+        if (pradd_idx == 1)
+            tg.config.add_enum(dsp + ".FB_MUX", str_or_default(ci->params, id_FB_MUX, "DISABLED"));
         tg.config.add_enum(dsp + ".SYMMETRY_MODE", str_or_default(ci->params, id_SYMMETRY_MODE, "DIRECT"));
 
         // Register stage parameters

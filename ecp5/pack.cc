@@ -1260,9 +1260,16 @@ class Ecp5Packer
                     NetInfo *mnet = mult->getPort(port);
                     if (mnet != nullptr && mnet != pnet) {
                         // Treat constants as equivalent even when represented as distinct nets pre-pack_constants.
-                        // (json-imported constant connections frequently end up as unique constant nets.)
-                        if (mnet->constant_value != IdString() && pnet->constant_value != IdString() &&
-                            mnet->constant_value == pnet->constant_value) {
+                        // Before pack_constants, constant_value may not be set yet, so also check driver cell type.
+                        auto is_const_net = [&](NetInfo *n) -> int {
+                            if (n->constant_value != IdString())
+                                return n->constant_value == ctx->id("VCC") ? 1 : 0;
+                            if (n->driver.cell != nullptr && n->driver.cell->type.in(id_GND, id_VCC))
+                                return n->driver.cell->type == id_VCC ? 1 : 0;
+                            return -1;
+                        };
+                        int mc = is_const_net(mnet), pc = is_const_net(pnet);
+                        if (mc >= 0 && mc == pc) {
                             return;
                         }
                         log_error("%s '%s' and MULT18X18D '%s' disagree on net for port %s\n",
@@ -1455,6 +1462,7 @@ class Ecp5Packer
                 // MULT9X9D/C uses the same hardware as MULT18X18D but with 9-bit ports
                 // MULT9X9C is simplified version without C input and CLK_DIV - maps to same hardware
                 // Convert to MULT18X18D for placement (hardware is the same)
+                ci->attrs[ctx->id("MULT9X9D_USED")] = 1;
                 ci->type = id_MULT18X18D;
                 for (auto sig : {"CLK", "CE", "RST"})
                     for (int i = 0; i < 4; i++)
@@ -1767,6 +1775,10 @@ class Ecp5Packer
                 if (ci->type == id_ALU24A)
                     ci->type = id_ALU24B;
                 // ALU24 MA/MB inputs MUST come from MULT P outputs (hardware constraint)
+                // Lattice uses OPADDNSUB/OPCINSEL port names; remap to OP0/OP1 for BEL
+                ci->renamePort(ctx->id("OPADDNSUB"), ctx->id("OP0"));
+                ci->renamePort(ctx->id("OPCINSEL"), ctx->id("OP1"));
+
                 for (auto sig : {"CLK", "CE", "RST"})
                     for (int i = 0; i < 4; i++)
                         autocreate_empty_port(ci, ctx->id(sig + std::to_string(i)));
@@ -1839,6 +1851,11 @@ class Ecp5Packer
 
                 // Convert ALU24B to ALU54B for placement (ALU24 uses ALU54 hardware)
                 ci->type = id_ALU54B;
+
+                // Constrain to right-half DSP (ALU54_7) — the trellis DB currently only
+                // has full ALU24/ALU54 register config entries for the right-half tiles.
+                ci->constr_abs_z = true;
+                ci->constr_z = 7;
             }
         }
         // Flush packed cells (PRADD cells absorbed into MULT)
