@@ -3191,9 +3191,9 @@ void Arch::assign_arch_info_for_cell(CellInfo *ci)
             ci->ramInfo.regmode_timing_id = id_DP16KD_REGMODE_A_OUTREG_REGMODE_B_OUTREG;
         }
     } else if (ci->type == id_MULT18X18D) {
-        // For the multiplier block, our timing db is dictated by whether any of the input/output registers are
-        // enabled. To that end, we need to work out what the parameters are for the INPUTA_CLK, INPUTB_CLK and
-        // OUTPUT_CLK are.
+        // For the multiplier block, our timing db is dictated by which of the input, pipeline and output registers
+        // are enabled. To that end, we need to work out what the parameters are for the INPUTA_CLK, INPUTB_CLK,
+        // PIPELINE_CLK and OUTPUT_CLK are.
         // The clock check is the same IN_A/B and OUT, so hoist it to a function
         auto get_clock_parameter = [&](std::string param_name) {
             std::string clk = str_or_default(ci->params, id(param_name), "NONE");
@@ -3215,6 +3215,10 @@ void Arch::assign_arch_info_for_cell(CellInfo *ci)
         std::string reg_output_clk = get_clock_parameter("REG_OUTPUT_CLK");
         const bool is_output_registered = reg_output_clk != "NONE";
 
+        // And the pipeline register, part way through the multiplier array
+        std::string reg_pipeline_clk = get_clock_parameter("REG_PIPELINE_CLK");
+        const bool is_pipeline_registered = reg_pipeline_clk != "NONE";
+
         // If only one of the inputs is registered, we are going to treat that as
         // neither input registered so that we don't have to deal with mixed timing.
         // Emit a warning to that effect.
@@ -3227,22 +3231,26 @@ void Arch::assign_arch_info_for_cell(CellInfo *ci)
                         ci->name.c_str(this), reg_inputa_clk.c_str(), reg_inputb_clk.c_str());
             log_warning("Timings for MULT18X18D %s will be calculated as though neither input were registered\n",
                         ci->name.c_str(this));
-
-            // Act as though the inputs are unregistered, so select timing DB based only on the
-            // output register mode
-            ci->multInfo.timing_id = is_output_registered ? id_MULT18X18D_REGS_OUTPUT : id_MULT18X18D_REGS_NONE;
-        } else {
-            // Based on our register settings, pick the timing data to use for this cell
-            if (!both_inputs_registered && !is_output_registered) {
-                ci->multInfo.timing_id = id_MULT18X18D_REGS_NONE;
-            } else if (both_inputs_registered && !is_output_registered) {
-                ci->multInfo.timing_id = id_MULT18X18D_REGS_INPUT;
-            } else if (!both_inputs_registered && is_output_registered) {
-                ci->multInfo.timing_id = id_MULT18X18D_REGS_OUTPUT;
-            } else if (both_inputs_registered && is_output_registered) {
-                ci->multInfo.timing_id = id_MULT18X18D_REGS_ALL;
-            }
         }
+
+        // The timing db has an entry for each register on its own (input, pipeline, output). With several, the
+        // inputs see the first register and P comes from the last one; the paths between them stay inside the
+        // block. (REGS_ALL is exactly the input setup and the output clock-to-P.)
+        IdString first_reg = id_MULT18X18D_REGS_NONE, last_reg = id_MULT18X18D_REGS_NONE;
+        if (both_inputs_registered)
+            first_reg = id_MULT18X18D_REGS_INPUT;
+        else if (is_pipeline_registered)
+            first_reg = id_MULT18X18D_REGS_PIPELINE;
+        else if (is_output_registered)
+            first_reg = id_MULT18X18D_REGS_OUTPUT;
+        if (is_output_registered)
+            last_reg = id_MULT18X18D_REGS_OUTPUT;
+        else if (is_pipeline_registered)
+            last_reg = id_MULT18X18D_REGS_PIPELINE;
+        else if (both_inputs_registered)
+            last_reg = id_MULT18X18D_REGS_INPUT;
+        ci->multInfo.timing_id = first_reg;
+        ci->multInfo.timing_id_out = last_reg;
         // If we aren't a pure combinatorial multiplier, then our timings are
         // calculated with respect to CLK0
         ci->multInfo.is_clocked = ci->multInfo.timing_id != id_MULT18X18D_REGS_NONE;

@@ -1247,7 +1247,7 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
         info.clock_port = clock_id;
         info.edge = RISING_EDGE;
         if (cell->ports.at(port).type == PORT_OUT) {
-            bool is_path = get_delay_from_tmg_db(cell->multInfo.timing_id, clock_id, port_group, info.clockToQ);
+            bool is_path = get_delay_from_tmg_db(cell->multInfo.timing_id_out, clock_id, port_group, info.clockToQ);
             NPNR_ASSERT(is_path);
         } else {
             get_setuphold_from_tmg_db(cell->multInfo.timing_id, clock_id, port_group, info.setup, info.hold);
