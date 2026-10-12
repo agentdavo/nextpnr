@@ -216,6 +216,12 @@ struct ArchCellInfo : BaseClusterInfo
         IdString timing_id;
         IdString timing_id_out;
     } multInfo;
+    struct
+    {
+        // Both output registers on one clock: the result R is a register.
+        bool is_clocked;
+        IdString clock;
+    } aluInfo;
 };
 
 NEXTPNR_NAMESPACE_END
