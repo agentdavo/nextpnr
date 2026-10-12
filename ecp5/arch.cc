@@ -1040,7 +1040,27 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
         }
         return TMG_IGNORE;
     } else if (cell->type == id_ALU54B) {
-        return TMG_IGNORE; // FIXME
+        if (!cell->aluInfo.is_clocked)
+            return TMG_IGNORE;
+        if (port.in(id_CLK0, id_CLK1, id_CLK2, id_CLK3))
+            return TMG_CLOCK_INPUT;
+        // A bus pin: the prefix and then a bit index
+        std::string pname = port.str(this);
+        auto bus = [&](const std::string &prefix) {
+            return pname.size() > prefix.size() && pname.compare(0, prefix.size(), prefix) == 0 &&
+                   std::isdigit(pname.at(prefix.size()));
+        };
+        if (bus("R")) {
+            clockInfoCount = 1;
+            return TMG_REGISTER_OUTPUT;
+        }
+        if (bus("MA") || bus("MB") || bus("A") || bus("B") || bus("C") || bus("OP") ||
+            port.in(id_SIGNEDIA, id_SIGNEDIB, id_CE0, id_CE1, id_CE2, id_CE3, id_RST0, id_RST1, id_RST2, id_RST3)) {
+            clockInfoCount = 1;
+            return TMG_REGISTER_INPUT;
+        }
+        // The cascade (CIN, CFB, CO) and the flags stay untimed
+        return TMG_IGNORE;
     } else if (cell->type == id_EHXPLLL) {
         return TMG_IGNORE;
     } else if (cell->type.in(id_DCUA, id_EXTREFB, id_PCSCLKDIV)) {
@@ -1111,6 +1131,35 @@ TimingPortClass Arch::getPortTimingClass(const CellInfo *cell, IdString port, in
                   cell->name.c_str(this));
     }
 }
+
+namespace {
+// ALU54B setup and clock-to-output in ns, per speed grade. These are estimates: prjtrellis has no ALU54B timing,
+// and the ECP5 data sheet (FPGA-DS-02012 3.4, table 3.20) only gives function rates. Its 18x18 multiply/accumulate
+// with input and output registers runs at 225 MHz on -8: 4.444 ns for the MULT18X18D input register to P (3.045 ns)
+// plus MA to the ALU output register, so that setup is at most 1.399 ns. -6 and -7 scale it by the MULT18X18D
+// input register clock-to-P (3.864 and 3.455 ns). A, B, C and OP go through the same muxes into the same adder,
+// so they get the same setup. CE, RST and SIGNED take the MULT18X18D CE0 setup; clock to R takes the MULT18X18D
+// output register clock to P. The data sheet also gives every sysDSP function 225 MHz at most on -8, which is not
+// modelled here.
+struct Alu54Timing
+{
+    double setup_m;    // MA, MB (from the MULT18X18D P outputs)
+    double setup_data; // A, B, C
+    double setup_op;   // OP, without opcode registers
+    double setup_ctrl; // CE, RST, SIGNEDIA, SIGNEDIB
+    double hold;
+    double clk_to_r;
+};
+const Alu54Timing &alu54_timing(int speed)
+{
+    static const Alu54Timing t[3] = {
+            {1.775, 1.775, 1.775, 0.252, 0, 0.735}, // -6
+            {1.588, 1.588, 1.588, 0.231, 0, 0.656}, // -7
+            {1.399, 1.399, 1.399, 0.210, 0, 0.578}, // -8
+    };
+    return t[std::min(speed, 2)];
+}
+} // namespace
 
 TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port, int index) const
 {
@@ -1251,6 +1300,25 @@ TimingClockingInfo Arch::getPortClockingInfo(const CellInfo *cell, IdString port
             NPNR_ASSERT(is_path);
         } else {
             get_setuphold_from_tmg_db(cell->multInfo.timing_id, clock_id, port_group, info.setup, info.hold);
+        }
+    } else if (cell->type == id_ALU54B) {
+        const Alu54Timing &t = alu54_timing(int(args.speed));
+        info.clock_port = cell->aluInfo.clock;
+        info.edge = RISING_EDGE;
+        std::string pname = port.str(this);
+        if (cell->ports.at(port).type == PORT_OUT) {
+            info.clockToQ = DelayQuad(getDelayFromNS(t.clk_to_r));
+        } else {
+            double setup = t.setup_data;
+            if (pname.compare(0, 2, "MA") == 0 || pname.compare(0, 2, "MB") == 0)
+                setup = t.setup_m;
+            else if (pname.compare(0, 2, "OP") == 0)
+                setup = t.setup_op;
+            else if (pname.compare(0, 2, "CE") == 0 || pname.compare(0, 3, "RST") == 0 ||
+                     pname.compare(0, 6, "SIGNED") == 0)
+                setup = t.setup_ctrl;
+            info.setup = DelayPair(getDelayFromNS(setup));
+            info.hold = DelayPair(getDelayFromNS(t.hold));
         }
     }
     return info;

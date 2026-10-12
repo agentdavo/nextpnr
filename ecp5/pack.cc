@@ -3254,6 +3254,13 @@ void Arch::assign_arch_info_for_cell(CellInfo *ci)
         // If we aren't a pure combinatorial multiplier, then our timings are
         // calculated with respect to CLK0
         ci->multInfo.is_clocked = ci->multInfo.timing_id != id_MULT18X18D_REGS_NONE;
+    } else if (ci->type == id_ALU54B) {
+        // Only an ALU54B whose result is registered (both halves, on one clock) is timed; anything else stays
+        // untimed as before.
+        std::string out0 = str_or_default(ci->params, id_REG_OUTPUT0_CLK, "NONE");
+        std::string out1 = str_or_default(ci->params, id_REG_OUTPUT1_CLK, "NONE");
+        ci->aluInfo.is_clocked = out0 != "NONE" && out0 == out1;
+        ci->aluInfo.clock = ci->aluInfo.is_clocked ? id(out0) : IdString();
     }
 }
 
