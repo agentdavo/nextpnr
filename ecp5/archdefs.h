@@ -210,7 +210,11 @@ struct ArchCellInfo : BaseClusterInfo
     struct
     {
         bool is_clocked;
+        // Timing for the inputs (setup to the first register they meet, or
+        // the combinational A/B to P) and for P (clock to P from the last
+        // register before it).
         IdString timing_id;
+        IdString timing_id_out;
     } multInfo;
 };
 
